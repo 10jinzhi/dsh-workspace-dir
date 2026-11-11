@@ -6,20 +6,20 @@ A DSH bundle that re-points a registered workspace at another directory — or m
 
 ## 安装（在 DSH 里填 GitHub 链接）
 
-设置 → 插件 → 安装，填入下面任意一种（推荐第一种，pnpm 的 GitHub 简写）：
+设置 → 插件 → 安装，粘贴下面任意一种（都实测可用）：
 
 ```
 github:10jinzhi/dsh-workspace-dir
 ```
 
 ```
-https://github.com/10jinzhi/dsh-workspace-dir.git
+git+ssh://git@github.com/10jinzhi/dsh-workspace-dir.git
 ```
 
-装好后会多出 `dsh-workspace-dir` 这一条 bundle，行 id 是 `workspace-dir`，不需要重启。
-
+- 第一种最简短；pnpm 会自己选传输方式。**如果所在网络屏蔽了 GitHub 的 HTTPS git**（会报 `git ls-remote failed … curl 28`），改用第二种走 SSH（需要本机已配置 GitHub SSH key）。
+- 装好后会多出 `dsh-workspace-dir` 这一条 bundle，行 id 是 `workspace-dir`，不需要重启 DSH。
 - 需要 DSH 桌面版（profile 里有 `tools`、`commands`、`workspaceRegistry`，默认都有）。
-- 升级：删掉再按同样链接装一次，或用插件页的更新按钮。
+- 升级：插件页卸载后按同样链接再装一次（安装固定在某个 commit，不会自动跟随 `main`）。
 - 卸载：插件页点卸载（等同 `remove_bundle`）。它只往 profile 写一行依赖、一条 bundle 声明和一个包目录，卸载会精确移除；DSH 程序文件不会被动过。
 
 ## 用法
