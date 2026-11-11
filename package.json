@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "dsh-workspace-dir",
   "version": "1.4.0",
   "description": "Re-point a registered Harness workspace at another directory, or move a folder into a new parent, and let its sessions follow.",
