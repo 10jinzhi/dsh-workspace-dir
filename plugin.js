@@ -305,6 +305,207 @@ async function refreshSessionIndex(ctx, warnings) {
   }
 }
 
+const EXPORT_KIND = 'dsh-workspace-export'
+const EXPORT_VERSION = 1
+
+/** Absolute path for an export/import file, defaulting to the home directory. */
+function exportFilePath(requested) {
+  const spelling = typeof requested === 'string' ? requested.trim() : ''
+  if (spelling === '') return join(homedir(), 'workspaces-export.json')
+  if (!isFullyQualified(spelling)) throw new Error(`文件必须是完整路径（例如 C:\\Users\\me\\workspaces.json）：${spelling}`)
+  return spelling
+}
+
+/**
+ * Write a portable snapshot of every workspace registration: title, absolute
+ * path, display order, the sessions its record accounts for, and the pending
+ * follow entries. Re-importing recreates whatever is missing.
+ */
+async function exportWorkspaces(ctx, options) {
+  const registry = requireService(ctx, 'workspaceRegistry')
+  const file = exportFilePath(options.file)
+  const rows = []
+  for (const [index, workspace] of registry.list().entries()) {
+    const record = registry.table?.get?.(workspace.id)
+    const sessions = Array.isArray(record?.sessionIds)
+      ? record.sessionIds.map(String)
+      : [...workspace.sessionIds].map(String)
+    rows.push({
+      title: workspace.title,
+      path: workspace.path,
+      order: index,
+      exists: await isDirectory(workspace.path),
+      sessions,
+      createdAt: workspace.createdAt,
+      updatedAt: workspace.updatedAt,
+    })
+  }
+  const follow = await readFollowMap()
+  const payload = {
+    kind: EXPORT_KIND,
+    version: EXPORT_VERSION,
+    exportedAt: new Date().toISOString(),
+    platform: process.platform,
+    workspaces: rows,
+    followMap: Object.fromEntries(Object.entries(follow).map(([key, value]) => [key, value.target])),
+  }
+  await mkdir(dirname(file), { recursive: true })
+  await writeFile(file, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
+  return {
+    file,
+    workspaces: rows.length,
+    missing: rows.filter((row) => !row.exists).length,
+    sessions: rows.reduce((total, row) => total + row.sessions.length, 0),
+    followEntries: Object.keys(follow).length,
+  }
+}
+
+function formatExport(result) {
+  return [
+    `已导出 ${result.workspaces} 个工作区到：${result.file}`,
+    `  会话归属 ${result.sessions} 条，跟随记录 ${result.followEntries} 条`,
+    result.missing > 0 ? `  其中 ${result.missing} 个工作区的目录当前不存在（导入时会跳过）` : '',
+  ].filter((line) => line !== '').join('\n')
+}
+
+/**
+ * Recreate the workspaces an export describes: create what is missing, restore
+ * titles and display order, optionally re-attach the recorded sessions, and
+ * merge the follow entries.
+ */
+async function importWorkspaces(ctx, options) {
+  const registry = requireService(ctx, 'workspaceRegistry')
+  const file = exportFilePath(options.file)
+  let payload
+  try {
+    payload = JSON.parse(await readFile(file, 'utf8'))
+  } catch (error) {
+    throw new Error(`读不到或解析不了导出文件：${file}（${messageOf(error)}）`)
+  }
+  if (payload?.kind !== EXPORT_KIND || !Array.isArray(payload.workspaces)) {
+    throw new Error('这不是本插件导出的工作区文件（缺少 kind/workspaces）')
+  }
+  const dryRun = options.dryRun === true
+  const restoreMembership = options.restoreMembership === true
+  const report = {
+    file,
+    dryRun,
+    created: [],
+    existing: [],
+    renamed: [],
+    missing: [],
+    membership: { attached: 0, skipped: 0 },
+    followMerged: 0,
+    warnings: [],
+  }
+
+  for (const entry of payload.workspaces) {
+    const path = typeof entry?.path === 'string' ? entry.path : ''
+    if (!isFullyQualified(path)) {
+      report.missing.push({ path, title: entry?.title, reason: '路径不合法' })
+      continue
+    }
+    const current = registry.list().find((workspace) => samePath(workspace.path, path))
+    if (current !== undefined) {
+      report.existing.push({ title: current.title, path: current.path })
+      const wanted = typeof entry.title === 'string' ? entry.title.trim() : ''
+      if (wanted !== '' && wanted !== current.title && !dryRun) {
+        try {
+          await current.setTitle(wanted)
+          report.renamed.push({ path: current.path, from: current.title, to: wanted })
+        } catch (error) {
+          report.warnings.push(`重命名 ${current.path} 失败：${messageOf(error)}`)
+        }
+      }
+      continue
+    }
+    if (!await isDirectory(path)) {
+      report.missing.push({ path, title: entry?.title, reason: '目录不存在' })
+      continue
+    }
+    if (dryRun) {
+      report.created.push({ path, title: entry?.title })
+      continue
+    }
+    try {
+      const wanted = typeof entry.title === 'string' && entry.title.trim() !== '' ? entry.title.trim() : undefined
+      const workspace = await registry.create(path, wanted)
+      report.created.push({ path: workspace.path, title: workspace.title })
+    } catch (error) {
+      report.warnings.push(`创建 ${path} 失败：${messageOf(error)}`)
+    }
+  }
+
+  if (!dryRun) {
+    const ordered = [...payload.workspaces].sort((left, right) => (left?.order ?? 0) - (right?.order ?? 0))
+    let anchor
+    for (const entry of [...ordered].reverse()) {
+      const workspace = registry.list().find((candidate) => samePath(candidate.path, entry?.path))
+      if (workspace === undefined) continue
+      try {
+        await registry.insertBefore(workspace.id, anchor)
+        anchor = workspace.id
+      } catch (error) {
+        report.warnings.push(`调整顺序 ${entry?.path} 失败：${messageOf(error)}`)
+      }
+    }
+  }
+
+  if (restoreMembership && !dryRun) {
+    for (const entry of payload.workspaces) {
+      const workspace = registry.list().find((candidate) => samePath(candidate.path, entry?.path))
+      if (workspace === undefined || !Array.isArray(entry.sessions)) continue
+      for (const sessionId of entry.sessions) {
+        if ([...workspace.sessionIds].some((id) => String(id) === String(sessionId))) continue
+        try {
+          await workspace.attachSession(sessionId)
+          report.membership.attached += 1
+        } catch {
+          report.membership.skipped += 1
+        }
+      }
+    }
+  }
+
+  if (!dryRun && payload.followMap !== null && typeof payload.followMap === 'object') {
+    const current = await readFollowMap()
+    for (const [from, to] of Object.entries(payload.followMap)) {
+      if (typeof from !== 'string' || typeof to !== 'string') continue
+      if (current[directoryKey(from)] !== undefined) continue
+      if (!isFullyQualified(to) || !await isDirectory(to)) continue
+      current[directoryKey(from)] = { target: to, at: new Date().toISOString() }
+      report.followMerged += 1
+    }
+    if (report.followMerged > 0) await writeFollowMap(current)
+  }
+
+  if (!dryRun) await refreshSessionIndex(ctx, report.warnings)
+  return report
+}
+
+function formatImport(result) {
+  const lines = []
+  if (result.dryRun) lines.push('（预演，未写入任何改动）')
+  lines.push(`${result.dryRun ? '将' : '已'}从 ${result.file} 导入：`)
+  lines.push(`  新建工作区: ${result.created.length} 个`)
+  for (const entry of result.created) lines.push(`    + ${entry.title ?? '(无标题)'} — ${entry.path}`)
+  lines.push(`  已存在、跳过: ${result.existing.length} 个`)
+  if (result.renamed.length > 0) {
+    lines.push(`  改回标题: ${result.renamed.length} 个`)
+    for (const entry of result.renamed) lines.push(`    ~ ${entry.from} → ${entry.to}`)
+  }
+  if (result.missing.length > 0) {
+    lines.push(`  无法导入: ${result.missing.length} 个`)
+    for (const entry of result.missing) lines.push(`    ! ${entry.title ?? ''} ${entry.path}（${entry.reason}）`)
+  }
+  if (result.membership.attached > 0 || result.membership.skipped > 0) {
+    lines.push(`  会话归属: 恢复 ${result.membership.attached} 个，跳过 ${result.membership.skipped} 个（会话 header 里的目录与工作区不一致）`)
+  }
+  if (result.followMerged > 0) lines.push(`  合并跟随记录: ${result.followMerged} 条`)
+  for (const warning of result.warnings) lines.push(`  注意: ${warning}`)
+  return lines.join('\n')
+}
+
 /**
  * Move one workspace onto a new directory.
  * @param ctx - plugin context carrying the Harness services.
@@ -584,6 +785,7 @@ const TOOL_DESCRIPTION = [
   'workspace — a running session immediately, a stored one the next time it is opened, when its own log records the',
   'directory change. The moveFolder action relocates a folder into a registered workspace directory (its files are',
   'moved on disk) and records a follow entry so its sessions follow even when no workspace claims them.',
+  'export writes every workspace registration to a JSON snapshot; import recreates what the snapshot describes.',
   'Use action "list" first to find the workspace, and "check" to see which sessions would follow.',
 ].join(' ')
 
@@ -592,8 +794,8 @@ const TOOL_PARAMETERS = {
   properties: {
     action: {
       type: 'string',
-      enum: ['list', 'check', 'move', 'moveFolder', 'map', 'refresh'],
-      description: 'list: every workspace with its recorded directory; check: session follow-up state; move: re-point one workspace; moveFolder: move a folder on disk into a registered workspace and follow it; map: show the recorded old→new follow entries; refresh: rebuild the session/directory index after folders moved outside the plugin.',
+      enum: ['list', 'check', 'move', 'moveFolder', 'map', 'export', 'import', 'refresh'],
+      description: 'list: every workspace with its recorded directory; check: session follow-up state; move: re-point one workspace; moveFolder: move a folder on disk into a registered workspace and follow it; map: show the recorded old→new follow entries; export: write a JSON snapshot of all workspaces; import: recreate workspaces from such a snapshot; refresh: rebuild the session/directory index after folders moved outside the plugin.',
     },
     workspace: {
       type: 'string',
@@ -610,6 +812,14 @@ const TOOL_PARAMETERS = {
     into: {
       type: 'string',
       description: 'moveFolder: an existing registered workspace directory to move it into.',
+    },
+    file: {
+      type: 'string',
+      description: 'export/import: absolute path of the snapshot JSON file. Omit for export to default to ~/workspaces-export.json.',
+    },
+    restoreMembership: {
+      type: 'boolean',
+      description: 'import: also re-attach the recorded sessions. Only sessions whose stored cwd matches the workspace path can attach. Defaults to false.',
     },
     migrateSessions: {
       type: 'boolean',
@@ -643,6 +853,7 @@ const COMMAND_FLAGS = new Map([
   ['--sessions', 'sessions'],
   ['--force', 'force'],
   ['--dry-run', 'dryRun'],
+  ['--membership', 'membership'],
   ['--check', 'check'],
 ])
 
@@ -689,8 +900,16 @@ export function apply(ctx) {
         render: (_args, value) => [{ type: 'text', text: value }],
       },
       async execute(args, exec) {
-        const action = ['move', 'check', 'moveFolder', 'map', 'refresh'].includes(args.action) ? args.action : 'list'
+        const action = ['move', 'check', 'moveFolder', 'map', 'refresh', 'export', 'import'].includes(args.action) ? args.action : 'list'
         if (action === 'list') return formatWorkspaceList(await readWorkspaces(registry))
+        if (action === 'export') return formatExport(await exportWorkspaces(ctx, { file: args.file }))
+        if (action === 'import') {
+          return formatImport(await importWorkspaces(ctx, {
+            file: args.file,
+            restoreMembership: args.restoreMembership,
+            dryRun: args.dryRun,
+          }))
+        }
         if (action === 'refresh') {
           const ok = await refreshSessionIndex(ctx, undefined)
           if (!ok) return '无法刷新会话索引：工作区注册表缺少索引方法。'
@@ -725,12 +944,41 @@ export function apply(ctx) {
     serviceCtx.commands.register({
       name: 'workspace-dir',
       description: '查看工作区目录，或把某个工作区改到新目录（旧目录已消失的会话会在下次打开时跟随）',
-      input: { hint: 'list | check <工作区> | move <工作区> <新目录> [--no-sessions] [--force] [--dry-run]' },
+      input: { hint: 'list | check <工作区> | move <工作区> <新目录> | export [文件] | import <文件> | map | refresh' },
       async handler({ rawInput }) {
         try {
           const { positional, flags } = parseCommandLine(rawInput)
           const action = (positional[0] ?? 'list').toLowerCase()
           if (action === 'list') return { kind: 'success', text: formatWorkspaceList(await readWorkspaces(registry)) }
+          if (action === 'export') {
+            return { kind: 'success', text: formatExport(await exportWorkspaces(ctx, { file: positional.slice(1).join(' ') })) }
+          }
+          if (action === 'import') {
+            const file = positional.slice(1).join(' ').trim()
+            if (file === '') return { kind: 'error', text: '用法：/workspace-dir import <导出文件路径> [--dry-run] [--membership]' }
+            return {
+              kind: 'success',
+              text: formatImport(await importWorkspaces(ctx, {
+                file,
+                restoreMembership: flags.has('membership'),
+                dryRun: flags.has('dryRun'),
+              })),
+            }
+          }
+          if (action === 'map') {
+            const entries = await readFollowMap()
+            const lines = [`跟随记录（${mapFilePath()}）：`]
+            const rows = Object.entries(entries)
+            if (rows.length === 0) lines.push('  （空）')
+            for (const [from, value] of rows) lines.push(`  ${from} → ${value.target}`)
+            return { kind: 'success', text: lines.join('\n') }
+          }
+          if (action === 'refresh') {
+            const ok = await refreshSessionIndex(ctx, undefined)
+            return ok
+              ? { kind: 'success', text: `会话索引已刷新。\n${formatWorkspaceList(await readWorkspaces(registry))}` }
+              : { kind: 'error', text: '无法刷新会话索引：工作区注册表缺少索引方法。' }
+          }
           if (action === 'check') {
             const workspace = findWorkspace(registry, positional.slice(1).join(' '))
             return { kind: 'success', text: await checkFollow(ctx, registry, workspace, workspace.path) }
