@@ -1,0 +1,4 @@
+- insert:
+    - id: workspace-dir
+      name: 'dsh-workspace-dir'
+      config: {}

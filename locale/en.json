@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Workspace directory",
+    "description": "Points a registered workspace at a different existing directory and migrates the sessions it owns onto that directory."
+  }
+}
