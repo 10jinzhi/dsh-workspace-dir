@@ -52,6 +52,22 @@ git+ssh://git@github.com/10jinzhi/dsh-workspace-dir.git
 - **旧目录仍然存在时**：DSH 用 header 里的 cwd 判断会话归属，旧目录还在的话这些会话不会跟随、也会从该工作区列表里消失（会话本身不删），所以默认拒绝，`force` 才继续。
 - **索引刷新**：DSH 的会话归属索引只在启动时构建；文件夹搬走后调用 `refresh`，用存储里的 header 重建它，工作区的会话计数立刻恢复。
 
+## 导出 / 导入工作区
+
+```
+/workspace-dir export                      # 导出到 %USERPROFILE%\workspaces-export.json
+/workspace-dir export D:\备份\ws.json       # 指定文件
+/workspace-dir import D:\备份\ws.json --dry-run
+/workspace-dir import D:\备份\ws.json
+/workspace-dir import D:\备份\ws.json --membership
+```
+
+- 导出的是一份 JSON 快照：每个工作区的标题、绝对路径、显示顺序、登记过的会话，以及当前的跟随记录。
+- 导入会把**缺失**的工作区按快照建回来（目录必须存在），已有的按路径对上并改回快照里的标题，再按快照恢复显示顺序，并合并跟随记录。
+- 目录已经不存在的条目会列在“无法导入”里，不会凭空造一个工作区。
+- 会话归属默认不恢复（DSH 只允许把 header 里目录与工作区一致的会话挂上去）；`--membership` 会尽力恢复并把成功/跳过数量报出来。
+- `--dry-run` 只报告打算做什么。
+
 ## 跟随记录
 
 `move` / `moveFolder` 会把「旧目录 → 新目录」写进 `%USERPROFILE%\.dsh\storages\workspace-dir-follow-map.json`。
