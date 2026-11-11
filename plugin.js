@@ -15,7 +15,9 @@
  * uninstalling the bundle removes every trace of it.
  */
 
-import { mkdir, readFile, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
+import { createReadStream } from 'node:fs'
+import { copyFile, mkdir, readFile, readdir, realpath, rename, stat, unlink, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, join, posix, win32 } from 'node:path'
 
@@ -306,7 +308,7 @@ async function refreshSessionIndex(ctx, warnings) {
 }
 
 const EXPORT_KIND = 'dsh-workspace-export'
-const EXPORT_VERSION = 1
+const EXPORT_VERSION = 2
 
 /** Absolute path for an export/import file, defaulting to the home directory. */
 function exportFilePath(requested) {
@@ -316,20 +318,124 @@ function exportFilePath(requested) {
   return spelling
 }
 
+function sessionStoreRoot() {
+  return join(dshHomeDirectory(), 'sessions')
+}
+
+/**
+ * Locate one session's log directory under the session store. The store groups
+ * logs by the mangled cwd of the session, and the plugin must not re-derive that
+ * spelling, so it finds the directory by session id and records the relative
+ * path for a byte-identical restore.
+ */
+async function findSessionLogDir(sessionId) {
+  const root = sessionStoreRoot()
+  let entries
+  try {
+    entries = await readdir(root, { withFileTypes: true })
+  } catch {
+    return undefined
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    const candidate = join(root, entry.name, sessionId)
+    if (await isDirectory(candidate)) return { absolute: candidate, relative: join(entry.name, sessionId) }
+  }
+  return undefined
+}
+
+function sha256Of(file) {
+  return new Promise((resolve, reject) => {
+    const hash = createHash('sha256')
+    const stream = createReadStream(file)
+    stream.on('error', reject)
+    stream.on('data', (chunk) => hash.update(chunk))
+    stream.on('end', () => resolve(hash.digest('hex')))
+  })
+}
+
+/**
+ * Describe one session's durable log, and — when `contentDir` is given — copy
+ * its bytes beside the export file so the snapshot alone can rebuild the session.
+ */
+async function describeSessionLog(sessionId, contentDir) {
+  const dir = await findSessionLogDir(sessionId)
+  if (dir === undefined) return undefined
+  let names
+  try {
+    names = (await readdir(dir.absolute, { withFileTypes: true })).filter((entry) => entry.isFile()).map((entry) => entry.name)
+  } catch {
+    return undefined
+  }
+  const files = []
+  for (const name of names.sort()) {
+    const absolute = join(dir.absolute, name)
+    const info = await stat(absolute)
+    files.push({ name, bytes: info.size, sha256: await sha256Of(absolute) })
+    if (contentDir !== undefined) {
+      await mkdir(join(contentDir, sessionId), { recursive: true })
+      await copyFile(absolute, join(contentDir, sessionId, name))
+    }
+  }
+  return { relative: dir.relative, files }
+}
+
+/** Whether this build can see a durable session with this id. */
+async function sessionKnown(ctx, sessionId) {
+  const live = ctx.get('agents')?.get(sessionId)
+  if (live !== undefined) return true
+  const persistence = ctx.get('sessionPersistence')
+  if (persistence === undefined) return false
+  try {
+    return (await persistence.stat(sessionId)) !== undefined
+  } catch {
+    return false
+  }
+}
+
 /**
  * Write a portable snapshot of every workspace registration: title, absolute
- * path, display order, the sessions its record accounts for, and the pending
- * follow entries. Re-importing recreates whatever is missing.
+ * path, display order, the sessions its record accounts for (with their log
+ * bytes when `includeContent`), and the pending follow entries. Re-importing
+ * recreates whatever is missing — including session logs that were deleted.
  */
 async function exportWorkspaces(ctx, options) {
   const registry = requireService(ctx, 'workspaceRegistry')
   const file = exportFilePath(options.file)
+  const includeContent = options.includeContent !== false
+  const contentDir = includeContent ? `${file}.sessions` : undefined
+  const archived = new Set(registry.archivedSessionIds.map(String))
+  const pinned = new Set(registry.pinnedSessionIds.map(String))
+  const selected = options.workspace === undefined ? registry.list() : [findWorkspace(registry, options.workspace)]
   const rows = []
-  for (const [index, workspace] of registry.list().entries()) {
+  let sessionCount = 0
+  let contentFiles = 0
+  let contentBytes = 0
+  let missingLogs = 0
+  for (const [index, workspace] of selected.entries()) {
     const record = registry.table?.get?.(workspace.id)
-    const sessions = Array.isArray(record?.sessionIds)
+    const ids = Array.isArray(record?.sessionIds)
       ? record.sessionIds.map(String)
       : [...workspace.sessionIds].map(String)
+    const sessions = []
+    for (const id of ids) {
+      const header = await sessionHeaderOf(ctx, id)
+      const log = await describeSessionLog(id, contentDir)
+      if (log === undefined) missingLogs += 1
+      else {
+        contentFiles += log.files.length
+        contentBytes += log.files.reduce((total, item) => total + item.bytes, 0)
+      }
+      sessions.push({
+        id,
+        cwd: typeof header?.cwd === 'string' ? header.cwd : undefined,
+        createdAt: header?.createdAt,
+        archived: archived.has(id),
+        pinned: pinned.has(id),
+        log,
+      })
+      sessionCount += 1
+    }
     rows.push({
       title: workspace.title,
       path: workspace.path,
@@ -346,6 +452,8 @@ async function exportWorkspaces(ctx, options) {
     version: EXPORT_VERSION,
     exportedAt: new Date().toISOString(),
     platform: process.platform,
+    sessionsRoot: sessionStoreRoot(),
+    content: includeContent ? 'embedded' : 'none',
     workspaces: rows,
     followMap: Object.fromEntries(Object.entries(follow).map(([key, value]) => [key, value.target])),
   }
@@ -353,25 +461,80 @@ async function exportWorkspaces(ctx, options) {
   await writeFile(file, `${JSON.stringify(payload, null, 2)}\n`, 'utf8')
   return {
     file,
+    contentDir,
     workspaces: rows.length,
     missing: rows.filter((row) => !row.exists).length,
-    sessions: rows.reduce((total, row) => total + row.sessions.length, 0),
+    sessions: sessionCount,
+    missingLogs,
+    contentFiles,
+    contentBytes,
+    archivedSessions: rows.reduce((total, row) => total + row.sessions.filter((item) => item.archived).length, 0),
     followEntries: Object.keys(follow).length,
   }
+}
+
+function formatBytes(total) {
+  if (total >= 1024 * 1024) return `${(total / (1024 * 1024)).toFixed(1)} MB`
+  if (total >= 1024) return `${Math.round(total / 1024)} KB`
+  return `${total} B`
 }
 
 function formatExport(result) {
   return [
     `已导出 ${result.workspaces} 个工作区到：${result.file}`,
-    `  会话归属 ${result.sessions} 条，跟随记录 ${result.followEntries} 条`,
+    `  会话 ${result.sessions} 个（日志缺失 ${result.missingLogs} 个），归档 ${result.archivedSessions} 个`,
+    result.contentDir === undefined
+      ? '  未包含会话日志内容'
+      : `  会话日志 ${result.contentFiles} 个文件 / ${formatBytes(result.contentBytes)}，复制到：${result.contentDir}`,
     result.missing > 0 ? `  其中 ${result.missing} 个工作区的目录当前不存在（导入时会跳过）` : '',
+    `  跟随记录 ${result.followEntries} 条`,
   ].filter((line) => line !== '').join('\n')
+}
+
+/** Accept both snapshot generations: v1 listed bare session ids, v2 carries objects. */
+function normalizeSessionEntries(value) {
+  if (!Array.isArray(value)) return []
+  const items = []
+  for (const entry of value) {
+    if (typeof entry === 'string') {
+      items.push({ id: entry, log: undefined })
+      continue
+    }
+    if (entry !== null && typeof entry === 'object' && typeof entry.id === 'string') {
+      items.push({
+        id: entry.id,
+        cwd: typeof entry.cwd === 'string' ? entry.cwd : undefined,
+        archived: entry.archived === true,
+        pinned: entry.pinned === true,
+        log: entry.log !== null && typeof entry.log === 'object' ? entry.log : undefined,
+      })
+    }
+  }
+  return items
+}
+
+/** Copy a snapshot's session log bytes back into the session store. */
+async function restoreSessionLog(exportFile, item) {
+  const relative = item.log?.relative
+  if (typeof relative !== 'string' || relative === '') return undefined
+  if (!Array.isArray(item.log.files) || item.log.files.length === 0) return undefined
+  const contentRoot = `${exportFile}.sessions`
+  const targetDir = join(sessionStoreRoot(), relative)
+  await mkdir(targetDir, { recursive: true })
+  const copied = []
+  for (const file of item.log.files) {
+    if (typeof file?.name !== 'string') continue
+    await copyFile(join(contentRoot, item.id, file.name), join(targetDir, file.name))
+    copied.push(file.name)
+  }
+  return copied
 }
 
 /**
  * Recreate the workspaces an export describes: create what is missing, restore
- * titles and display order, optionally re-attach the recorded sessions, and
- * merge the follow entries.
+ * titles and display order, rebuild deleted session logs from the snapshot's
+ * bytes, re-attach the recorded sessions at their recorded positions, surface
+ * archived sessions, and merge the follow entries.
  */
 async function importWorkspaces(ctx, options) {
   const registry = requireService(ctx, 'workspaceRegistry')
@@ -385,8 +548,13 @@ async function importWorkspaces(ctx, options) {
   if (payload?.kind !== EXPORT_KIND || !Array.isArray(payload.workspaces)) {
     throw new Error('这不是本插件导出的工作区文件（缺少 kind/workspaces）')
   }
+  if (payload.version !== 1 && payload.version !== 2) {
+    throw new Error(`导出文件版本是 ${String(payload.version)}，本插件只认 1 和 2`)
+  }
   const dryRun = options.dryRun === true
-  const restoreMembership = options.restoreMembership === true
+  const restoreMembership = options.restoreMembership !== false
+  const restoreContent = options.restoreContent !== false
+  const unarchive = options.unarchive !== false
   const report = {
     file,
     dryRun,
@@ -394,7 +562,9 @@ async function importWorkspaces(ctx, options) {
     existing: [],
     renamed: [],
     missing: [],
-    membership: { attached: 0, skipped: 0 },
+    membership: { restored: 0, ordered: 0, skipped: [] },
+    archive: { restored: 0, kept: 0 },
+    content: { rebuilt: 0 },
     followMerged: 0,
     warnings: [],
   }
@@ -454,17 +624,75 @@ async function importWorkspaces(ctx, options) {
   if (restoreMembership && !dryRun) {
     for (const entry of payload.workspaces) {
       const workspace = registry.list().find((candidate) => samePath(candidate.path, entry?.path))
-      if (workspace === undefined || !Array.isArray(entry.sessions)) continue
-      for (const sessionId of entry.sessions) {
-        if ([...workspace.sessionIds].some((id) => String(id) === String(sessionId))) continue
+      if (workspace === undefined) continue
+      const items = normalizeSessionEntries(entry.sessions)
+
+      // Sessions whose durable log is gone come back from the snapshot's bytes.
+      for (const item of items) {
+        if (await findSessionLogDir(item.id) !== undefined) continue
+        if (item.log === undefined) {
+          report.membership.skipped.push({ id: item.id, reason: '本地没有该会话日志，快照里也没有内容' })
+          continue
+        }
         try {
-          await workspace.attachSession(sessionId)
-          report.membership.attached += 1
+          const copied = await restoreSessionLog(file, item)
+          if (copied === undefined) {
+            report.membership.skipped.push({ id: item.id, reason: '快照缺少该会话的日志内容' })
+            continue
+          }
+          report.content.rebuilt += 1
+          if (!(await sessionKnown(ctx, item.id))) {
+            report.warnings.push(`会话 ${item.id} 的日志已重建（${copied.length} 个文件），但 DSH 暂时还看不到；重启后重试导入即可归位。`)
+          }
+        } catch (error) {
+          report.membership.skipped.push({ id: item.id, reason: `重建日志失败：${messageOf(error)}` })
+        }
+      }
+
+      // attachSession prepends, so re-attach in reverse snapshot order.
+      const rawIds = () => {
+        try {
+          const record = registry.table?.get?.(workspace.id)
+          return Array.isArray(record?.sessionIds) ? record.sessionIds.map(String) : []
         } catch {
-          report.membership.skipped += 1
+          return []
+        }
+      }
+      for (const item of [...items].reverse()) {
+        if (rawIds().includes(item.id)) continue
+        try {
+          await workspace.attachSession(item.id)
+          report.membership.restored += 1
+        } catch (error) {
+          report.membership.skipped.push({ id: item.id, reason: messageOf(error) })
+        }
+      }
+      // Then enforce the recorded order among the sessions that are accounted.
+      for (const item of items) {
+        if (!rawIds().includes(item.id)) continue
+        try {
+          await workspace.insertSessionBefore(item.id)
+          report.membership.ordered += 1
+        } catch {
+          /* Not accounted (cwd mismatch); the record keeps what it can. */
+        }
+      }
+
+      for (const item of items) {
+        if (item.archived !== true) continue
+        if (unarchive) {
+          try {
+            await registry.unarchiveSession(item.id)
+            report.archive.restored += 1
+          } catch (error) {
+            report.warnings.push(`恢复归档会话 ${item.id} 可见失败：${messageOf(error)}`)
+          }
+        } else {
+          report.archive.kept += 1
         }
       }
     }
+    await refreshSessionIndex(ctx, report.warnings)
   }
 
   if (!dryRun && payload.followMap !== null && typeof payload.followMap === 'object') {
@@ -479,7 +707,6 @@ async function importWorkspaces(ctx, options) {
     if (report.followMerged > 0) await writeFollowMap(current)
   }
 
-  if (!dryRun) await refreshSessionIndex(ctx, report.warnings)
   return report
 }
 
@@ -498,12 +725,43 @@ function formatImport(result) {
     lines.push(`  无法导入: ${result.missing.length} 个`)
     for (const entry of result.missing) lines.push(`    ! ${entry.title ?? ''} ${entry.path}（${entry.reason}）`)
   }
-  if (result.membership.attached > 0 || result.membership.skipped > 0) {
-    lines.push(`  会话归属: 恢复 ${result.membership.attached} 个，跳过 ${result.membership.skipped} 个（会话 header 里的目录与工作区不一致）`)
+  if (result.membership.restored > 0 || result.membership.ordered > 0 || result.membership.skipped.length > 0) {
+    lines.push(`  会话归位: 恢复 ${result.membership.restored} 个，按快照顺序排 ${result.membership.ordered} 个`)
+    for (const entry of result.membership.skipped) lines.push(`    ! ${entry.id}（${entry.reason}）`)
+  }
+  if (result.content.rebuilt > 0) lines.push(`  重建被删除的会话日志: ${result.content.rebuilt} 个`)
+  if (result.archive.restored > 0 || result.archive.kept > 0) {
+    lines.push(`  归档会话: 重新可见 ${result.archive.restored} 个${result.archive.kept > 0 ? `，保持归档 ${result.archive.kept} 个` : ''}`)
   }
   if (result.followMerged > 0) lines.push(`  合并跟随记录: ${result.followMerged} 条`)
   for (const warning of result.warnings) lines.push(`  注意: ${warning}`)
   return lines.join('\n')
+}
+
+/** Remove one workspace registration; its directory and sessions are untouched. */
+async function deleteWorkspace(ctx, selector) {
+  const registry = requireService(ctx, 'workspaceRegistry')
+  const workspace = findWorkspace(registry, selector)
+  const before = {
+    id: String(workspace.id),
+    title: workspace.title,
+    path: workspace.path,
+    sessions: recordedSessionIds(registry, workspace.id, [...workspace.sessionIds]).length,
+  }
+  const deleted = await registry.delete(workspace.id)
+  if (typeof registry.rebuildEntities === 'function') registry.rebuildEntities()
+  await refreshSessionIndex(ctx, undefined)
+  return { ...before, deleted }
+}
+
+function formatDelete(result) {
+  return [
+    result.deleted
+      ? `已删除工作区「${result.title}」（id: ${result.id}）`
+      : `工作区「${result.title}」本就不存在`,
+    `  目录 ${result.path} 保留，${result.sessions} 个会话保留——它们会显示在「未分组」下（或仍是归档状态）`,
+    '  想找回：导入对应的快照，或用 move 重新指向该目录。',
+  ].join('\n')
 }
 
 /**
@@ -785,7 +1043,10 @@ const TOOL_DESCRIPTION = [
   'workspace — a running session immediately, a stored one the next time it is opened, when its own log records the',
   'directory change. The moveFolder action relocates a folder into a registered workspace directory (its files are',
   'moved on disk) and records a follow entry so its sessions follow even when no workspace claims them.',
-  'export writes every workspace registration to a JSON snapshot; import recreates what the snapshot describes.',
+  'export writes a snapshot of every workspace registration plus the bytes of its session logs; import recreates the',
+  'registrations, rebuilds deleted session logs from those bytes, re-attaches each session at its recorded position,',
+  'and makes archived sessions visible again. delete removes one workspace registration and leaves its directory and',
+  'sessions in place (they show up as ungrouped).',
   'Use action "list" first to find the workspace, and "check" to see which sessions would follow.',
 ].join(' ')
 
@@ -794,12 +1055,12 @@ const TOOL_PARAMETERS = {
   properties: {
     action: {
       type: 'string',
-      enum: ['list', 'check', 'move', 'moveFolder', 'map', 'export', 'import', 'refresh'],
-      description: 'list: every workspace with its recorded directory; check: session follow-up state; move: re-point one workspace; moveFolder: move a folder on disk into a registered workspace and follow it; map: show the recorded old→new follow entries; export: write a JSON snapshot of all workspaces; import: recreate workspaces from such a snapshot; refresh: rebuild the session/directory index after folders moved outside the plugin.',
+      enum: ['list', 'check', 'move', 'moveFolder', 'map', 'export', 'import', 'delete', 'refresh'],
+      description: 'list: every workspace with its recorded directory; check: session follow-up state; move: re-point one workspace; moveFolder: move a folder on disk into a registered workspace and follow it; map: show the recorded old→new follow entries; export: snapshot workspaces and session logs; import: restore workspaces, session logs, membership and positions from a snapshot; delete: remove one workspace registration; refresh: rebuild the session/directory index.',
     },
     workspace: {
       type: 'string',
-      description: 'Workspace to act on: its title, its workspace id, or its current directory path.',
+      description: 'Workspace to act on: its title, its workspace id, or its current directory path. For export, limits the snapshot to that one workspace.',
     },
     path: {
       type: 'string',
@@ -815,11 +1076,23 @@ const TOOL_PARAMETERS = {
     },
     file: {
       type: 'string',
-      description: 'export/import: absolute path of the snapshot JSON file. Omit for export to default to ~/workspaces-export.json.',
+      description: 'export/import: absolute path of the snapshot JSON file. Omit for export to default to ~/workspaces-export.json. A content-bearing export also writes <file>.sessions/.',
+    },
+    includeContent: {
+      type: 'boolean',
+      description: 'export: also copy every session log next to the snapshot so a deleted session can be rebuilt. Defaults to true.',
     },
     restoreMembership: {
       type: 'boolean',
-      description: 'import: also re-attach the recorded sessions. Only sessions whose stored cwd matches the workspace path can attach. Defaults to false.',
+      description: 'import: re-attach the recorded sessions at their recorded positions. Defaults to true.',
+    },
+    restoreContent: {
+      type: 'boolean',
+      description: 'import: rebuild session logs that are missing locally from the snapshot bytes. Defaults to true.',
+    },
+    unarchive: {
+      type: 'boolean',
+      description: 'import: make sessions the snapshot recorded as archived visible again. Defaults to true.',
     },
     migrateSessions: {
       type: 'boolean',
@@ -853,7 +1126,9 @@ const COMMAND_FLAGS = new Map([
   ['--sessions', 'sessions'],
   ['--force', 'force'],
   ['--dry-run', 'dryRun'],
-  ['--membership', 'membership'],
+  ['--no-content', 'noContent'],
+  ['--no-membership', 'noMembership'],
+  ['--keep-archived', 'keepArchived'],
   ['--check', 'check'],
 ])
 
@@ -900,16 +1175,27 @@ export function apply(ctx) {
         render: (_args, value) => [{ type: 'text', text: value }],
       },
       async execute(args, exec) {
-        const action = ['move', 'check', 'moveFolder', 'map', 'refresh', 'export', 'import'].includes(args.action) ? args.action : 'list'
+        const action = ['move', 'check', 'moveFolder', 'map', 'refresh', 'export', 'import', 'delete'].includes(args.action)
+          ? args.action
+          : 'list'
         if (action === 'list') return formatWorkspaceList(await readWorkspaces(registry))
-        if (action === 'export') return formatExport(await exportWorkspaces(ctx, { file: args.file }))
+        if (action === 'export') {
+          return formatExport(await exportWorkspaces(ctx, {
+            file: args.file,
+            includeContent: args.includeContent,
+            workspace: args.workspace,
+          }))
+        }
         if (action === 'import') {
           return formatImport(await importWorkspaces(ctx, {
             file: args.file,
             restoreMembership: args.restoreMembership,
+            restoreContent: args.restoreContent,
+            unarchive: args.unarchive,
             dryRun: args.dryRun,
           }))
         }
+        if (action === 'delete') return formatDelete(await deleteWorkspace(ctx, args.workspace))
         if (action === 'refresh') {
           const ok = await refreshSessionIndex(ctx, undefined)
           if (!ok) return '无法刷新会话索引：工作区注册表缺少索引方法。'
@@ -943,27 +1229,40 @@ export function apply(ctx) {
 
     serviceCtx.commands.register({
       name: 'workspace-dir',
-      description: '查看工作区目录，或把某个工作区改到新目录（旧目录已消失的会话会在下次打开时跟随）',
-      input: { hint: 'list | check <工作区> | move <工作区> <新目录> | export [文件] | import <文件> | map | refresh' },
+      description: '查看/修改工作区目录、导出导入工作区快照（含会话日志）',
+      input: { hint: 'list | check <工作区> | move <工作区> <新目录> | export [文件] [--no-content] | import <文件> [--dry-run] [--no-membership] [--keep-archived] | delete <工作区> | map | refresh' },
       async handler({ rawInput }) {
         try {
           const { positional, flags } = parseCommandLine(rawInput)
           const action = (positional[0] ?? 'list').toLowerCase()
           if (action === 'list') return { kind: 'success', text: formatWorkspaceList(await readWorkspaces(registry)) }
           if (action === 'export') {
-            return { kind: 'success', text: formatExport(await exportWorkspaces(ctx, { file: positional.slice(1).join(' ') })) }
+            return {
+              kind: 'success',
+              text: formatExport(await exportWorkspaces(ctx, {
+                file: positional.slice(1).join(' '),
+                includeContent: !flags.has('noContent'),
+              })),
+            }
           }
           if (action === 'import') {
             const file = positional.slice(1).join(' ').trim()
-            if (file === '') return { kind: 'error', text: '用法：/workspace-dir import <导出文件路径> [--dry-run] [--membership]' }
+            if (file === '') return { kind: 'error', text: '用法：/workspace-dir import <导出文件路径> [--dry-run] [--no-membership] [--keep-archived]' }
             return {
               kind: 'success',
               text: formatImport(await importWorkspaces(ctx, {
                 file,
-                restoreMembership: flags.has('membership'),
+                restoreMembership: !flags.has('noMembership'),
+                restoreContent: !flags.has('noContent'),
+                unarchive: !flags.has('keepArchived'),
                 dryRun: flags.has('dryRun'),
               })),
             }
+          }
+          if (action === 'delete') {
+            const target = positional.slice(1).join(' ').trim()
+            if (target === '') return { kind: 'error', text: '用法：/workspace-dir delete <工作区标题|ID|路径>（只删登记，目录和会话都保留）' }
+            return { kind: 'success', text: formatDelete(await deleteWorkspace(ctx, target)) }
           }
           if (action === 'map') {
             const entries = await readFollowMap()

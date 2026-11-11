@@ -1,8 +1,8 @@
 # dsh-workspace-dir
 
-一个 DeepSeek Harness（DSH）插件：把侧边栏里**已注册工作区**指向的目录换成另一个目录，或者把整个文件夹搬进新位置，并让工作区名下的会话跟着走。
+一个 DeepSeek Harness（DSH）插件：管理侧边栏里的**工作区**——改目录、搬文件夹、导出/导入（含会话日志）、重建被删掉的会话。
 
-A DSH bundle that re-points a registered workspace at another directory — or moves a folder into a new parent — and lets the sessions that lived there follow the move.
+A DSH bundle for workspace housekeeping: re-point a workspace, move a folder into a new parent, snapshot/restore workspaces **together with their session logs**, and rebuild deleted sessions.
 
 ## 安装（在 DSH 里填 GitHub 链接）
 
@@ -11,83 +11,96 @@ A DSH bundle that re-points a registered workspace at another directory — or m
 ```
 github:10jinzhi/dsh-workspace-dir
 ```
-
 ```
 git+ssh://git@github.com/10jinzhi/dsh-workspace-dir.git
 ```
 
-- 第一种最简短；pnpm 会自己选传输方式。**如果所在网络屏蔽了 GitHub 的 HTTPS git**（会报 `git ls-remote failed … curl 28`），改用第二种走 SSH（需要本机已配置 GitHub SSH key）。
-- 装好后会多出 `dsh-workspace-dir` 这一条 bundle，行 id 是 `workspace-dir`，不需要重启 DSH。
-- 需要 DSH 桌面版（profile 里有 `tools`、`commands`、`workspaceRegistry`，默认都有）。
-- 升级：插件页卸载后按同样链接再装一次（安装固定在某个 commit，不会自动跟随 `main`）。
-- 卸载：插件页点卸载（等同 `remove_bundle`）。它只往 profile 写一行依赖、一条 bundle 声明和一个包目录，卸载会精确移除；DSH 程序文件不会被动过。
+- 第一种最简短；pnpm 会自己选传输方式。**如果所在网络屏蔽了 GitHub 的 HTTPS git**（报 `git ls-remote failed … curl 28`），改用第二种走 SSH。
+- 装好后多出 `dsh-workspace-dir` 这一条 bundle，行 id 是 `workspace-dir`，不需要重启 DSH。
+- 升级：先卸载再按同样链接装一次（安装固定在某个 commit，不跟随 `main`）。
+- 卸载：插件页点卸载。它只往 profile 写一行依赖、一条 bundle 声明和一个包目录，卸载会精确移除。
 
 ## 用法
 
-两个入口，同一套实现：
-
 | 入口 | 例子 |
 |---|---|
-| 对话（agent 工具 `workspace_directory`） | “把 deepseek bili 工作区改到 F:\Work\bili” |
-| 斜杠命令 `/workspace-dir` | `list` / `check <工作区>` / `move <工作区> <新目录>` / `map` |
+| 对话（agent 工具 `workspace_directory`） | “把 deepseek bili 改到 F:\Work\bili”、“导出所有工作区”、“把这个工作区删了再导入回来” |
+| 斜杠命令 `/workspace-dir` | `list` / `check <工作区>` / `move <工作区> <新目录>` / `export [文件]` / `import <文件>` / `delete <工作区>` / `map` / `refresh` |
 
 工具参数：
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `action` | 必填 | `list` 列出工作区；`check` 看某工作区会话的跟随状态；`move` 改工作区路径；`moveFolder` 搬文件夹并跟随；`map` 看跟随记录；`refresh` 重建会话索引 |
+| `action` | 必填 | `list`、`check`、`move`、`moveFolder`、`map`、`export`、`import`、`delete`、`refresh` |
 | `workspace` | - | 工作区标题 / ID / 当前路径（重名时用 ID） |
 | `path` | - | 新目录，必须已存在、必须是完整路径 |
 | `from` / `into` | - | `moveFolder`：要搬的文件夹、搬进哪个已存在目录 |
-| `migrateSessions` | true | 让会话跟随 |
-| `force` | false | 旧目录仍然存在时也强制改 |
-| `dryRun` | false | 只校验和预演，不写入 |
+| `file` | - | `export`/`import` 的快照路径；`export` 省略时写到 `~\\workspaces-export.json` |
+| `includeContent` | true | `export` 是否把会话日志字节一起复制到 `<快照>.sessions/` |
+| `restoreMembership` | true | `import` 是否把会话按快照顺序挂回工作区 |
+| `restoreContent` | true | `import` 是否用快照里的字节重建本地丢掉的会话日志 |
+| `unarchive` | true | `import` 是否让快照里处于归档状态的会话重新可见 |
+| `migrateSessions` / `force` / `dryRun` | 见说明 | 分别控制跟随、强制改、只预演 |
 
-## 它做了什么
-
-- **工作区路径**：写入 DSH 自己的工作区域持久化表（原子写 + schema 校验），并触发 `domain/changed`，侧边栏即时刷新——不会手改 `workspace.json`。
-- **会话跟随**：会话的 `cwd` 存在它自己的日志 header 里（append-only，不能改写）。所以真正发生的是——
-  - 运行中的会话：当场 `workingDirectory.set` 到新目录；
-  - 未打开的会话：下次打开时，由插件的 `agent/created` 监听器完成同样的迁移，会话日志里追加一条 `working-directory/change`。不会出现“目录不存在打不开”。
-- **旧目录仍然存在时**：DSH 用 header 里的 cwd 判断会话归属，旧目录还在的话这些会话不会跟随、也会从该工作区列表里消失（会话本身不删），所以默认拒绝，`force` 才继续。
-- **索引刷新**：DSH 的会话归属索引只在启动时构建；文件夹搬走后调用 `refresh`，用存储里的 header 重建它，工作区的会话计数立刻恢复。
-
-## 导出 / 导入工作区
+## 导出 / 导入（含会话日志）
 
 ```
-/workspace-dir export                      # 导出到 %USERPROFILE%\workspaces-export.json
-/workspace-dir export D:\备份\ws.json       # 指定文件
-/workspace-dir import D:\备份\ws.json --dry-run
-/workspace-dir import D:\备份\ws.json
-/workspace-dir import D:\备份\ws.json --membership
+/workspace-dir export C:\Users\me\backups\ws.json
+/workspace-dir import C:\Users\me\backups\ws.json --dry-run
+/workspace-dir import C:\Users\me\backups\ws.json
 ```
 
-- 导出的是一份 JSON 快照：每个工作区的标题、绝对路径、显示顺序、登记过的会话，以及当前的跟随记录。
-- 导入会把**缺失**的工作区按快照建回来（目录必须存在），已有的按路径对上并改回快照里的标题，再按快照恢复显示顺序，并合并跟随记录。
-- 目录已经不存在的条目会列在“无法导入”里，不会凭空造一个工作区。
-- 会话归属默认不恢复（DSH 只允许把 header 里目录与工作区一致的会话挂上去）；`--membership` 会尽力恢复并把成功/跳过数量报出来。
-- `--dry-run` 只报告打算做什么。
+快照结构（`version: 2`）：
 
-## 跟随记录
+```json
+{
+  "kind": "dsh-workspace-export", "version": 2, "platform": "win32",
+  "content": "embedded",
+  "workspaces": [{
+    "order": 0, "title": "临时小任务", "path": "C:\\...\\临时小任务", "exists": true,
+    "sessions": [{
+      "id": "session-…", "cwd": "C:\\...\\临时小任务", "archived": false, "pinned": false,
+      "log": { "relative": "--C-…--\\session-…", "files": [{ "name": "session.v4.jsonl.zstd", "bytes": 299174, "sha256": "…" }] }
+    }]
+  }],
+  "followMap": { "旧目录": "新目录" }
+}
+```
 
-`move` / `moveFolder` 会把「旧目录 → 新目录」写进 `%USERPROFILE%\.dsh\storages\workspace-dir-follow-map.json`。
-这样即使某个会话没有被任何工作区登记（老会话大多如此），它下次打开时也会落到新目录。
-每个会话被迁移后对应条目自动删除；全部用完文件自动消失。删掉这个文件就等于立刻停用跟随。
+日志字节放在 `<快照>.sessions/<会话 id>/` 下。导入时按这个顺序处理：
 
-## 批量搬家
+1. **注册**：没有的工作区用 `registry.create` 建（目录必须已存在），有的只把标题改回快照值。
+2. **顺序**：按 `order` 重排侧边栏。
+3. **重建会话**：本地磁盘上找不到某个会话的日志目录 → 从 `<快照>.sessions/` 原样复制回 `~/.dsh/sessions/<快照记录的相对路径>/`，字节一致（sha256 可核对）。
+4. **归位**：按快照顺序把会话挂回工作区（`attachSession` 是前插，所以按倒序挂、再统一 `insertSessionBefore` 排正）。只有会话 header 里的 cwd 与工作区路径一致才能挂；不一致的会逐条列在“跳过”里。
+5. **归档**：快照里 `archived: true` 的会话，导入后 `unarchiveSession` 让它们重新可见（`--keep-archived` 保留归档）。
+6. **跟随记录**：只合并本地缺的条目。最后 `refresh` 重建会话索引。
 
-对每个要搬的文件夹调一次 `moveFolder`（`from` = 原目录，`into` = 目标父目录）：插件把文件夹整目录移过去、把对应工作区的路径改到新位置、并写入跟随记录（覆盖该目录下**所有**会话）。搬完调一次 `refresh`。
+### 关于“会话被删掉”
+
+DSH 没有“删除会话”这个操作，删工作区只删登记，会话仍在磁盘、会掉到「未分组」。所以：
+
+- **工作区删除后导入** → 会话按快照归位，这正是“未分组要归位置”。
+- **日志文件被手工删掉** → 只要快照里带内容，导入会按原路径、原字节重建，会话随之复活；重建后 `refresh` 若仍看不到，会提示“重启后重试导入即可归位”（DSH 的会话列表在启动时建立索引）。
+- 快照里没有内容的会话（`--no-content` 导出）无法重建，只能归位已有日志。
+
+## 跟随记录（运行期状态）
+
+`move` / `moveFolder` 会把「旧目录 → 新目录」写进 `~/.dsh/storages/workspace-dir-follow-map.json`，让没登记在工作区里的老会话也能在下次打开时落到新目录；每个会话迁移完对应条目自动删除，用完文件消失。
 
 ## 还原
 
-把文件夹移回原位置，再用 `move` 把工作区指回旧路径（工具输出每次都附还原指引）。插件不保存额外状态，跟随记录用完即删。
+- 改错目录：`move` 回旧路径（旧目录必须存在）。
+- 删错工作区：`import` 快照即可（目录和会话都还在）。
+- 搬错文件夹：把文件夹移回原位，再 `move` 工作区指回去。
 
 ## 已知限制
 
-- 迁移是“追加日志”，因此会话里会留下一条「工作目录已更改」的系统提示。
-- 旧目录仍然存在时无法让会话跟随（见上），这是 DSH 的归属规则决定的。
-- 会话 header 里的 cwd 字符串不会改变；只有旧目录消失时才按“缺失”状态保留其归属。
+- 会话迁移是追加日志，会在会话里留一条「工作目录已更改」的系统提示。
+- 旧目录仍然存在时，会话不会跟随（DSH 用 header 的 cwd 判断归属），`move` 默认拒绝，`force` 才继续。
+- 归属校验以 header cwd 为准：cwd 与工作区路径不一致的会话无法挂回去，只能留在「未分组」。
+- 快照按会话 id 记录日志相对路径；跨机器恢复要求两边的会话存储布局一致（同一 cwd 拼写）。
 
 ## 协议
 
-MIT。图标为原创 SVG。
+MIT。
